@@ -1,0 +1,8 @@
+# 빌드 산출물 (build.sh로 재생성)
+WMover.app/
+
+# macOS
+.DS_Store
+
+# 진단 로그
+*.log
