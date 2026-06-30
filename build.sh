@@ -36,8 +36,8 @@ swiftc -O \
     -framework Cocoa -framework ApplicationServices -framework IOKit \
     -o "$BIN"
 
-echo "▸ 코드 서명 (ad-hoc)"
-codesign --force --deep --sign - "$APP"
+echo "▸ 코드 서명 (Apple Development — 안정적 식별자, 재빌드해도 권한 유지)"
+codesign --force --sign "Apple Development: Suyong Lim (HK3VBAYTP6)" "$APP"
 
 echo "✅ 완료: $(pwd)/$APP"
 echo "   실행:  open $APP   (첫 실행 시 손쉬운 사용 권한 허용 필요)"

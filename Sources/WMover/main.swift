@@ -1,6 +1,7 @@
 import Cocoa
 import ApplicationServices
 import IOKit.pwr_mgt
+import ServiceManagement
 
 // MARK: - 설정 (단축키 조합은 여기서 바꾼다)
 //   위치조절(move)   : Control + Shift   + 좌클릭 드래그
@@ -35,7 +36,9 @@ final class WindowMover {
     private var initialMouse = CGPoint.zero
     private var initialWinPos = CGPoint.zero
     private var initialWinSize = CGSize.zero
+    private var pendingSize: CGSize?          // 리사이즈 종료 시 1회 적용할 최종 크기
     private var eventTap: CFMachPort?
+    private lazy var overlay = OverlayWindow() // 리사이즈 미리보기 외곽선
 
     /// 현재 modifier 조합으로 어떤 동작인지 판정
     private func mode(for flags: CGEventFlags) -> Mode {
@@ -120,7 +123,12 @@ final class WindowMover {
         initialWinPos = pos
         initialWinSize = size
         self.mode = mode
-        AXUIElementPerformAction(win, kAXRaiseAction as CFString) // 클릭한 윈도우를 앞으로
+        AXUIElementPerformAction(win, kAXRaiseAction as CFString) // 대상 윈도우를 앞으로
+        if mode == .resize {
+            // 리사이즈는 라이브로 안 바꾸고 외곽선 미리보기부터 띄운다
+            pendingSize = size
+            overlay.show(frame: Self.cocoaRect(topLeft: pos, size: size))
+        }
         return true
     }
 
@@ -135,19 +143,36 @@ final class WindowMover {
                 AXUIElementSetAttributeValue(win, kAXPositionAttribute as CFString, v)
             }
         case .resize:
-            var s = CGSize(width:  max(Config.minWidth,  initialWinSize.width  + dx),
+            // 대상 앱은 안 건드리고 외곽선 오버레이만 갱신 (리플로우 없음 → 부드러움)
+            let s = CGSize(width:  max(Config.minWidth,  initialWinSize.width  + dx),
                            height: max(Config.minHeight, initialWinSize.height + dy))
-            if let v = AXValueCreate(.cgSize, &s) {
-                AXUIElementSetAttributeValue(win, kAXSizeAttribute as CFString, v)
-            }
+            pendingSize = s
+            overlay.show(frame: Self.cocoaRect(topLeft: initialWinPos, size: s))
+            _ = win
         case .none:
             break
         }
     }
 
     private func endDrag() {
+        // 리사이즈였다면 마지막 크기를 딱 한 번 적용
+        if mode == .resize, let win = targetWindow, var s = pendingSize {
+            if let v = AXValueCreate(.cgSize, &s) {
+                AXUIElementSetAttributeValue(win, kAXSizeAttribute as CFString, v)
+            }
+        }
+        overlay.hide()
         mode = .none
         targetWindow = nil
+        pendingSize = nil
+    }
+
+    /// Quartz(좌상단 원점) 프레임 → Cocoa(좌하단 원점) 프레임 변환
+    static func cocoaRect(topLeft: CGPoint, size: CGSize) -> NSRect {
+        let primaryHeight = NSScreen.screens.first?.frame.height ?? 0
+        return NSRect(x: topLeft.x,
+                      y: primaryHeight - topLeft.y - size.height,
+                      width: size.width, height: size.height)
     }
 
     // MARK: AX 헬퍼
@@ -199,6 +224,45 @@ final class WindowMover {
     }
 }
 
+// MARK: - 리사이즈 미리보기 오버레이
+//   드래그 중엔 대상 앱을 건드리지 않고, 목표 크기를 나타내는 반투명 외곽선만 그린다.
+//   (대상 앱의 매 픽셀 리플로우를 피해 버벅임 제거)
+final class OverlayWindow {
+    private let window: NSWindow
+
+    init() {
+        window = NSWindow(contentRect: .zero, styleMask: .borderless,
+                          backing: .buffered, defer: false)
+        window.isOpaque = false
+        window.backgroundColor = .clear
+        window.hasShadow = false
+        window.ignoresMouseEvents = true
+        window.level = .screenSaver // 일반 윈도우보다 위
+        window.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle, .fullScreenAuxiliary]
+        window.contentView = OutlineView()
+    }
+
+    func show(frame: NSRect) {
+        window.setFrame(frame, display: true)
+        window.orderFrontRegardless()
+    }
+
+    func hide() {
+        window.orderOut(nil)
+    }
+}
+
+final class OutlineView: NSView {
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor.controlAccentColor.withAlphaComponent(0.15).setFill()
+        bounds.fill()
+        let path = NSBezierPath(rect: bounds.insetBy(dx: 1.5, dy: 1.5))
+        path.lineWidth = 3
+        NSColor.controlAccentColor.setStroke()
+        path.stroke()
+    }
+}
+
 // MARK: - 잠자기 방지 (카페인 기능)
 //   앱이 켜져 있는 동안 맥이 idle 슬립에 빠지지 않게 한다.
 //   디스플레이 슬립을 막으면 시스템 idle 슬립도 함께 막혀 원조 Caffeine과 동작이 같다.
@@ -230,12 +294,38 @@ final class SleepGuard {
     }
 }
 
+// MARK: - 로그인 항목 (맥 시작 시 자동 실행)
+//   macOS 13+ SMAppService.mainApp 사용 — 별도 헬퍼 앱 없이 앱 자신을 등록한다.
+//   등록 정보는 시스템 설정 > 일반 > 로그인 항목에 노출되며, 거기서 끌 수도 있다.
+enum LoginItem {
+    static var isEnabled: Bool {
+        SMAppService.mainApp.status == .enabled
+    }
+
+    /// 등록/해제. 성공 여부를 반환한다.
+    @discardableResult
+    static func setEnabled(_ enabled: Bool) -> Bool {
+        do {
+            if enabled {
+                try SMAppService.mainApp.register()
+            } else {
+                try SMAppService.mainApp.unregister()
+            }
+            return true
+        } catch {
+            wlog("LoginItem.setEnabled(\(enabled)) FAILED: \(error)")
+            return false
+        }
+    }
+}
+
 // MARK: - 메뉴바 앱
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private let mover = WindowMover()
     private let sleepGuard = SleepGuard()
     private var sleepItem: NSMenuItem!
+    private var loginItem: NSMenuItem!
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupStatusItem()
@@ -243,6 +333,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // 실행 시 잠자기 방지 자동 켜짐
         sleepGuard.enable()
         sleepItem.state = sleepGuard.isActive ? .on : .off
+        // 로그인 항목 현재 등록 상태 반영
+        loginItem.state = LoginItem.isEnabled ? .on : .off
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -264,6 +356,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         sleepItem = NSMenuItem(title: "잠자기 방지", action: #selector(toggleSleep), keyEquivalent: "")
         sleepItem.target = self
         menu.addItem(sleepItem)
+        loginItem = NSMenuItem(title: "맥 시작 시 실행", action: #selector(toggleLoginItem), keyEquivalent: "")
+        loginItem.target = self
+        menu.addItem(loginItem)
         menu.addItem(.separator())
         menu.addItem(withTitle: "접근성 설정 열기…",
                      action: #selector(openAccessibility), keyEquivalent: "")
@@ -294,6 +389,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func toggleSleep() {
         sleepItem.state = sleepGuard.toggle() ? .on : .off
+    }
+
+    @objc private func toggleLoginItem() {
+        let target = !LoginItem.isEnabled
+        if LoginItem.setEnabled(target) {
+            loginItem.state = target ? .on : .off
+        } else {
+            // 등록 실패(예: 미서명 빌드) 시 시스템 설정으로 안내
+            loginItem.state = LoginItem.isEnabled ? .on : .off
+            let url = URL(string: "x-apple.systempreferences:com.apple.LoginItems-Settings.extension")!
+            NSWorkspace.shared.open(url)
+        }
     }
 
     @objc private func openAccessibility() {
